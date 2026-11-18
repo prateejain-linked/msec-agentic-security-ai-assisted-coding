@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+using System.Text.Json;
 using CatalogService.Models;
 using CatalogService.Simulated;
 
@@ -47,6 +49,11 @@ public class ProductService
 
     public async Task<ServiceResult<IReadOnlyList<Product>>> ListAsync(string? category, int page, int pageSize)
     {
+        if (page <= 0 || pageSize <= 0)
+        {
+            return ServiceResult<IReadOnlyList<Product>>.BadRequest("Page and pageSize must be greater than zero.");
+        }
+
         var all = await _products.QueryAsync(p =>
             category is null || p.Category.Equals(category, StringComparison.OrdinalIgnoreCase));
 
@@ -54,7 +61,11 @@ public class ProductService
 
         // BUG #1: pagination parameters are ignored — every matching item is
         // returned regardless of page / pageSize.
-        IReadOnlyList<Product> items = ordered;
+        // FIX: page after filtering and sorting; long arithmetic prevents offset overflow.
+        var offset = (long)(page - 1) * pageSize;
+        IReadOnlyList<Product> items = offset >= ordered.Count
+            ? Array.Empty<Product>()
+            : ordered.Skip((int)offset).Take(pageSize).ToList();
 
         return ServiceResult<IReadOnlyList<Product>>.Ok(items);
     }
@@ -65,17 +76,28 @@ public class ProductService
 
         // BUG #4: a missing product is returned as a 200 with a null body
         // instead of a 404.
-        return ServiceResult<Product>.Ok(product!);
+        // FIX: report missing documents, including deleted products, as not found.
+        return product is null
+            ? ServiceResult<Product>.NotFound($"Product '{id}' not found")
+            : ServiceResult<Product>.Ok(product);
     }
 
     public async Task<ServiceResult<Product>> CreateAsync(CreateProductRequest request)
     {
         // BUG #3: no validation — a zero/negative price (or empty name) is accepted.
+        // FIX: reject invalid fields before storing a new product.
+        var error = ValidateProduct(request.Name, request.Category, request.Price, request.Stock);
+        if (error is not null)
+        {
+            return ServiceResult<Product>.BadRequest(error);
+        }
 
         var product = new Product
         {
             // BUG #2: the id is never generated, so the stored document and the
             // response come back with an empty id and cannot be fetched later.
+            // FIX: unique IDs also prevent the ID-keyed simulator from overwriting prior creates.
+            Id = Guid.NewGuid().ToString("N"),
             Name = request.Name,
             Category = request.Category,
             Price = request.Price,
@@ -92,6 +114,13 @@ public class ProductService
         if (existing is null)
         {
             return ServiceResult<Product>.NotFound($"Product '{id}' not found");
+        }
+
+        // FIX: validate before mutating the simulator's shared product object.
+        var error = ValidateProduct(request.Name, request.Category, request.Price, request.Stock);
+        if (error is not null)
+        {
+            return ServiceResult<Product>.BadRequest(error);
         }
 
         existing.Name = request.Name;
@@ -118,9 +147,63 @@ public class ProductService
     ///   3. persist the resulting blob URL on the product (ImageUrl),
     ///   4. publish an "ImageAdded" event onto the simulated Queue.
     /// This is intentionally NOT implemented — design and build it.
+    /// FIX: the implementation below now completes this flow using only local simulators.
     /// </summary>
-    public Task<ServiceResult<Product>> AttachImageAsync(string id, byte[] content, string contentType)
+    public async Task<ServiceResult<Product>> AttachImageAsync(string id, byte[] content, string contentType)
     {
-        throw new NotImplementedException("Bonus: implement the image-upload end-to-end flow.");
+        var product = await _products.ReadItemAsync(id);
+        if (product is null)
+        {
+            return ServiceResult<Product>.NotFound($"Product '{id}' not found");
+        }
+
+        if (content.Length == 0)
+        {
+            return ServiceResult<Product>.BadRequest("Image content must not be empty.");
+        }
+
+        if (!MediaTypeHeaderValue.TryParse(contentType, out var mediaType)
+            || mediaType.MediaType is not string type
+            || !type.StartsWith("image/", StringComparison.OrdinalIgnoreCase)
+            || type == "image/*")
+        {
+            return ServiceResult<Product>.BadRequest("Content type must be a specific image media type.");
+        }
+
+        // FIX: use a unique blob name so successive uploads do not overwrite stored bytes.
+        var blobName = $"{product.Id}/{Guid.NewGuid():N}";
+        product.ImageUrl = await _images.UploadAsync(blobName, content);
+        var updated = await _products.ReplaceItemAsync(product);
+
+        // Publish only after the product points to the uploaded bytes.
+        await _events.SendMessageAsync(JsonSerializer.Serialize(new
+        {
+            type = "ImageAdded",
+            productId = updated.Id,
+            imageUrl = updated.ImageUrl
+        }));
+
+        return ServiceResult<Product>.Ok(updated);
+    }
+
+    private static string? ValidateProduct(string? name, string? category, decimal price, int stock)
+    {
+        // FIX: keep create and update validation consistent; zero stock remains valid.
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return "Name must not be empty.";
+        }
+
+        if (string.IsNullOrWhiteSpace(category))
+        {
+            return "Category must not be empty.";
+        }
+
+        if (price <= 0)
+        {
+            return "Price must be greater than zero.";
+        }
+
+        return stock < 0 ? "Stock must not be negative." : null;
     }
 }

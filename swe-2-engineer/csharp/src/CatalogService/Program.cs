@@ -55,6 +55,7 @@ app.MapDelete("/products/{id}", async (string id, ProductService svc) =>
 });
 
 // BONUS endpoint — wired up but the service method is not implemented yet.
+// FIX: the service now uploads these raw bytes and publishes an event using local simulators.
 app.MapPost("/products/{id}/image", async (string id, HttpRequest req, ProductService svc) =>
 {
     using var ms = new MemoryStream();
