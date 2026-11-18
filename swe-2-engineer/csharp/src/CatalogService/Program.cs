@@ -54,7 +54,6 @@ app.MapDelete("/products/{id}", async (string id, ProductService svc) =>
     return ToHttp(result);
 });
 
-// BONUS endpoint — wired up but the service method is not implemented yet.
 app.MapPost("/products/{id}/image", async (string id, HttpRequest req, ProductService svc) =>
 {
     using var ms = new MemoryStream();

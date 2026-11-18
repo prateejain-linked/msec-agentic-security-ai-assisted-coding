@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CatalogService.Models;
 using CatalogService.Simulated;
 
@@ -7,9 +8,7 @@ namespace CatalogService.Services;
 /// Business logic for the product catalog. Talks to the simulated Cosmos
 /// container (products), Blob container (images) and Queue (events).
 ///
-/// NOTE FOR CANDIDATE: several behaviours in this class are incorrect. The test
-/// suite documents the expected behaviour. Use your AI agent to locate and fix
-/// the defects, then implement the bonus image-upload flow.
+/// The test suite documents the expected behaviour.
 /// </summary>
 public class ProductService
 {
@@ -52,9 +51,10 @@ public class ProductService
 
         var ordered = all.OrderBy(p => p.Id, StringComparer.Ordinal).ToList();
 
-        // BUG #1: pagination parameters are ignored — every matching item is
-        // returned regardless of page / pageSize.
-        IReadOnlyList<Product> items = ordered;
+        IReadOnlyList<Product> items = ordered
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToList();
 
         return ServiceResult<IReadOnlyList<Product>>.Ok(items);
     }
@@ -63,19 +63,24 @@ public class ProductService
     {
         var product = await _products.ReadItemAsync(id);
 
-        // BUG #4: a missing product is returned as a 200 with a null body
-        // instead of a 404.
-        return ServiceResult<Product>.Ok(product!);
+        if (product is null)
+        {
+            return ServiceResult<Product>.NotFound($"Product '{id}' not found");
+        }
+
+        return ServiceResult<Product>.Ok(product);
     }
 
     public async Task<ServiceResult<Product>> CreateAsync(CreateProductRequest request)
     {
-        // BUG #3: no validation — a zero/negative price (or empty name) is accepted.
+        if (request.Price <= 0)
+        {
+            return ServiceResult<Product>.BadRequest("Price must be greater than zero.");
+        }
 
         var product = new Product
         {
-            // BUG #2: the id is never generated, so the stored document and the
-            // response come back with an empty id and cannot be fetched later.
+            Id = Guid.NewGuid().ToString(),
             Name = request.Name,
             Category = request.Category,
             Price = request.Price,
@@ -112,15 +117,33 @@ public class ProductService
     }
 
     /// <summary>
-    /// BONUS: attach an image to a product. The expected end-to-end behaviour is:
+    /// Attaches an image to a product:
     ///   1. validate the product exists (404 otherwise),
     ///   2. upload the bytes to the simulated Blob container,
     ///   3. persist the resulting blob URL on the product (ImageUrl),
     ///   4. publish an "ImageAdded" event onto the simulated Queue.
-    /// This is intentionally NOT implemented — design and build it.
     /// </summary>
-    public Task<ServiceResult<Product>> AttachImageAsync(string id, byte[] content, string contentType)
+    public async Task<ServiceResult<Product>> AttachImageAsync(string id, byte[] content, string contentType)
     {
-        throw new NotImplementedException("Bonus: implement the image-upload end-to-end flow.");
+        var existing = await _products.ReadItemAsync(id);
+        if (existing is null)
+        {
+            return ServiceResult<Product>.NotFound($"Product '{id}' not found");
+        }
+
+        var blobName = Guid.NewGuid().ToString();
+        existing.ImageUrl = await _images.UploadAsync(blobName, content);
+
+        var updated = await _products.ReplaceItemAsync(existing);
+        var message = JsonSerializer.Serialize(new
+        {
+            type = "ImageAdded",
+            productId = id,
+            imageUrl = updated.ImageUrl,
+            contentType
+        });
+        await _events.SendMessageAsync(message);
+
+        return ServiceResult<Product>.Ok(updated);
     }
 }

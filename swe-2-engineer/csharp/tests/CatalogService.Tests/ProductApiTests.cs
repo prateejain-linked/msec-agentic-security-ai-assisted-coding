@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using CatalogService.Models;
+using CatalogService.Simulated;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace CatalogService.Tests;
@@ -126,9 +128,12 @@ public class ProductApiTests : IClassFixture<WebApplicationFactory<Program>>
     [Trait("Category", "Bonus")]
     public async Task Bonus_Upload_Image_Sets_Url_And_Publishes_Event()
     {
-        var client = NewClient();
+        using var app = _factory.WithWebHostBuilder(_ => { });
+        using var client = app.CreateClient();
+        var queue = app.Services.GetRequiredService<SimulatedQueue>();
 
-        var content = new ByteArrayContent(new byte[] { 1, 2, 3, 4 });
+        var imageBytes = new byte[] { 1, 2, 3, 4 };
+        using var content = new ByteArrayContent(imageBytes);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
         var upload = await client.PostAsync("/products/demo-2/image", content);
         Assert.Equal(HttpStatusCode.OK, upload.StatusCode);
@@ -141,16 +146,33 @@ public class ProductApiTests : IClassFixture<WebApplicationFactory<Program>>
         var get = await client.GetAsync("/products/demo-2");
         var fetched = await get.Content.ReadFromJsonAsync<Product>(Json);
         Assert.Equal(product.ImageUrl, fetched!.ImageUrl);
+
+        var blobs = app.Services.GetRequiredService<SimulatedBlobContainer>();
+        var blobName = new Uri(product.ImageUrl!).Segments[^1];
+        var storedBytes = await blobs.DownloadAsync(blobName);
+        Assert.NotNull(storedBytes);
+        Assert.Equal(imageBytes, storedBytes);
+
+        using var message = JsonDocument.Parse(Assert.Single(queue.Messages));
+        var imageEvent = message.RootElement;
+        Assert.Equal("ImageAdded", imageEvent.GetProperty("type").GetString());
+        Assert.Equal("demo-2", imageEvent.GetProperty("productId").GetString());
+        Assert.Equal(product.ImageUrl, imageEvent.GetProperty("imageUrl").GetString());
+        Assert.Equal("image/png", imageEvent.GetProperty("contentType").GetString());
     }
 
     [Fact]
     [Trait("Category", "Bonus")]
     public async Task Bonus_Upload_Image_For_Missing_Product_Returns_404()
     {
-        var client = NewClient();
+        using var app = _factory.WithWebHostBuilder(_ => { });
+        using var client = app.CreateClient();
+        var queue = app.Services.GetRequiredService<SimulatedQueue>();
         var content = new ByteArrayContent(new byte[] { 9 });
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
         var upload = await client.PostAsync("/products/missing/image", content);
         Assert.Equal(HttpStatusCode.NotFound, upload.StatusCode);
+        Assert.Empty(queue.Messages);
+        Assert.Equal(0, app.Services.GetRequiredService<SimulatedBlobContainer>().Count);
     }
 }
