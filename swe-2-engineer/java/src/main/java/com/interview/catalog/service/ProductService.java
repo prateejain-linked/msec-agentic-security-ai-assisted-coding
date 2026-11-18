@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Business logic for the product catalog. Talks to the simulated Cosmos container
@@ -50,6 +51,11 @@ public class ProductService {
     }
 
     public ServiceResult<List<Product>> list(String category, int page, int pageSize) {
+        // Reject values that would make skip/limit throw and surface as a 500.
+        if (page < 1 || pageSize < 1) {
+            return ServiceResult.badRequest("page and pageSize must be >= 1");
+        }
+
         List<Product> all = products.query(p ->
                 category == null || p.getCategory().equalsIgnoreCase(category));
 
@@ -59,7 +65,12 @@ public class ProductService {
 
         // BUG #1: pagination parameters are ignored — every matching item is
         // returned regardless of page / pageSize.
-        List<Product> items = ordered;
+        // FIX #1: apply 1-based pagination to the sorted list. The offset is
+        // computed as a long to avoid int overflow; a page past the end yields [].
+        List<Product> items = ordered.stream()
+                .skip((long) (page - 1) * pageSize)
+                .limit(pageSize)
+                .toList();
 
         return ServiceResult.ok(items);
     }
@@ -69,15 +80,29 @@ public class ProductService {
 
         // BUG #4: a missing product is returned as a 200 with a null body
         // instead of a 404.
+        // FIX #4: a missing product must produce a 404, not a 200 with a null body.
+        if (product == null) {
+            return ServiceResult.notFound("Product '" + id + "' not found");
+        }
         return ServiceResult.ok(product);
     }
 
     public ServiceResult<Product> create(CreateProductRequest request) {
         // BUG #3: no validation — a zero/negative price (or empty name) is accepted.
+        // FIX #3: reject invalid input with a 400 instead of storing it.
+        if (request.name() == null || request.name().isBlank()) {
+            return ServiceResult.badRequest("name must not be empty");
+        }
+        if (request.price() <= 0) {
+            return ServiceResult.badRequest("price must be greater than 0");
+        }
 
         Product product = new Product();
         // BUG #2: the id is never generated, so the stored document and the
         // response come back with an empty id and cannot be fetched later.
+        // FIX #2: generate a unique id; previously the empty default id was used,
+        // so every product was stored under the same key and was not retrievable.
+        product.setId(UUID.randomUUID().toString());
         product.setName(request.name());
         product.setCategory(request.category());
         product.setPrice(request.price());
@@ -116,9 +141,25 @@ public class ProductService {
      *   2. upload the bytes to the simulated Blob container,
      *   3. persist the resulting blob URL on the product (imageUrl),
      *   4. publish an "ImageAdded" event onto the simulated Queue.
-     * This is intentionally NOT implemented — design and build it.
      */
     public ServiceResult<Product> attachImage(String id, byte[] content, String contentType) {
-        throw new UnsupportedOperationException("Bonus: implement the image-upload end-to-end flow.");
+        Product product = products.readItem(id);
+        if (product == null) {
+            return ServiceResult.notFound("Product '" + id + "' not found");
+        }
+
+        // Only image uploads are accepted; contentType is otherwise unused because
+        // the simulated blob container cannot store it.
+        if (contentType == null || !contentType.toLowerCase().startsWith("image/")) {
+            return ServiceResult.badRequest("contentType must be an image/* type");
+        }
+
+        // Unique blob name per upload so re-uploads don't overwrite earlier images.
+        String url = images.upload(id + "/" + UUID.randomUUID(), content);
+        product.setImageUrl(url);
+        Product updated = products.replaceItem(product);
+
+        events.sendMessage("ImageAdded:" + id + ":" + url);
+        return ServiceResult.ok(updated);
     }
 }
