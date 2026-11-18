@@ -51,6 +51,11 @@ public class ProductService {
     }
 
     public ServiceResult<List<Product>> list(String category, int page, int pageSize) {
+        // Reject values that would make skip/limit throw and surface as a 500.
+        if (page < 1 || pageSize < 1) {
+            return ServiceResult.badRequest("page and pageSize must be >= 1");
+        }
+
         List<Product> all = products.query(p ->
                 category == null || p.getCategory().equalsIgnoreCase(category));
 
