@@ -1,5 +1,6 @@
 package com.interview.catalog.service;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.interview.catalog.model.CreateProductRequest;
 import com.interview.catalog.model.Product;
 import com.interview.catalog.model.UpdateProductRequest;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Business logic for the product catalog. Talks to the simulated Cosmos container
@@ -59,7 +61,10 @@ public class ProductService {
 
         // BUG #1: pagination parameters are ignored — every matching item is
         // returned regardless of page / pageSize.
-        List<Product> items = ordered;
+        List<Product> items = ordered.stream()
+                .skip((page - 1L) * pageSize)
+                .limit(pageSize)
+                .toList();
 
         return ServiceResult.ok(items);
     }
@@ -69,15 +74,25 @@ public class ProductService {
 
         // BUG #4: a missing product is returned as a 200 with a null body
         // instead of a 404.
+        if (product == null) {
+            return ServiceResult.notFound("Product '" + id + "' not found");
+        }
         return ServiceResult.ok(product);
     }
 
     public ServiceResult<Product> create(CreateProductRequest request) {
         // BUG #3: no validation — a zero/negative price (or empty name) is accepted.
+        if (request.name() == null || request.name().equals("")) {
+            return ServiceResult.badRequest("Name must not be empty");
+        }
+        if (request.price() <= 0) {
+            return ServiceResult.badRequest("Price must be greater than zero");
+        }
 
         Product product = new Product();
         // BUG #2: the id is never generated, so the stored document and the
         // response come back with an empty id and cannot be fetched later.
+        product.setId(UUID.randomUUID().toString());
         product.setName(request.name());
         product.setCategory(request.category());
         product.setPrice(request.price());
@@ -119,6 +134,19 @@ public class ProductService {
      * This is intentionally NOT implemented — design and build it.
      */
     public ServiceResult<Product> attachImage(String id, byte[] content, String contentType) {
-        throw new UnsupportedOperationException("Bonus: implement the image-upload end-to-end flow.");
+        Product product = products.readItem(id);
+        if (product == null) {
+            return ServiceResult.notFound("Product '" + id + "' not found");
+        }
+
+        String imageUrl = images.upload(id + "/" + UUID.randomUUID(), content);
+        product.setImageUrl(imageUrl);
+        Product updated = products.replaceItem(product);
+        events.sendMessage(JsonNodeFactory.instance.objectNode()
+                .put("type", "ImageAdded")
+                .put("productId", id)
+                .put("imageUrl", imageUrl)
+                .toString());
+        return ServiceResult.ok(updated);
     }
 }
